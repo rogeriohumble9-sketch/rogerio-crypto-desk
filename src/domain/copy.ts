@@ -9,7 +9,34 @@ export const COPY_DEFAULTS = {
   dailyTargetUsd: 20,
   maxFillAgeMs: 60_000,
   maxDeviationPct: 0.3,
+  /** Máximo de posições copiadas abertas ao mesmo tempo (US$ 5 por trade dentro do limite diário de US$ 15). */
+  maxOpenPositions: 2,
 };
+
+const EXIT_FEE_RATE = 0.001;
+
+export interface OpenRiskPosition {
+  coin: string;
+  side: "BUY" | "SELL";
+  qty: number;
+  stop: number;
+  mark: number | null;
+  entry: number;
+}
+
+/** Perda adicional possível se o stop for atingido a partir do preço atual (inclui taxa de saída). Sem preço, usa a entrada. */
+export function riskToStop(position: OpenRiskPosition): number {
+  const ref = position.mark ?? position.entry;
+  const distance = position.side === "BUY" ? ref - position.stop : position.stop - ref;
+  const price = Math.max(0, distance) * position.qty;
+  return price + position.stop * position.qty * EXIT_FEE_RATE;
+}
+
+/** Limite diário restante = limite − perda já tomada (realizado + aberto, marcado a mercado). Nunca negativo. */
+export function remainingLossBudget(dailyLossUsd: number, dayPnl: number): number {
+  const lossTaken = Math.max(0, -dayPnl);
+  return Math.max(0, dailyLossUsd - lossTaken);
+}
 
 export interface CopySizeInput {
   equity: number;
@@ -137,6 +164,14 @@ export interface DecideInput {
   binancePrice: number | null;
   maxDeviationPct: number;
   blocked: null | "loss" | "profit";
+  /** Pausa manual do módulo de cópia: sem entradas novas. Saídas e stops continuam. */
+  paused?: boolean;
+  /** P&L do dia = realizado + aberto (patrimônio atual − patrimônio no início da sessão). */
+  dayPnl?: number;
+  dailyLossUsd?: number;
+  maxOpenPositions?: number;
+  /** Posições copiadas abertas agora (de todos os traders). */
+  openPositions?: OpenRiskPosition[];
   sameSideOpen: boolean;
   unrealizedPnl: number | null;
   publicStop: number | null;
@@ -187,8 +222,18 @@ export function decideCopy(input: DecideInput): CopyDecision {
   if (deviation > input.maxDeviationPct) {
     return { action: "skip", reason: `preço Hyperliquid desviou ${deviation.toFixed(2)}% da Binance (máx. ${input.maxDeviationPct}%)` };
   }
+  if (input.paused) return { action: "skip", reason: "cópia pausada (sem novas entradas)" };
   if (input.blocked === "loss" || input.blocked === "profit") {
     return { action: "skip", reason: input.blocked === "loss" ? "limite de perda diária da cópia" : "meta diária da cópia atingida" };
+  }
+  const open = input.openPositions ?? [];
+  const baseCoin = (coin: string) => coin.split(":").pop()?.replace(/[^a-zA-Z0-9]/g, "").toUpperCase() ?? coin;
+  if (open.some((position) => baseCoin(position.coin) === baseCoin(input.coin))) {
+    return { action: "skip", reason: `já há posição aberta em ${baseCoin(input.coin)} (no máximo 1 por moeda, sem aumentar nem fazer preço médio)` };
+  }
+  const maxOpen = input.maxOpenPositions ?? COPY_DEFAULTS.maxOpenPositions;
+  if (open.length >= maxOpen) {
+    return { action: "skip", reason: `limite de ${maxOpen} posições abertas ao mesmo tempo` };
   }
   const side = input.kind === "open-long" ? "BUY" : "SELL";
   if (input.sameSideOpen && input.unrealizedPnl != null && input.unrealizedPnl < 0) {
@@ -207,6 +252,16 @@ export function decideCopy(input: DecideInput): CopyDecision {
     slippagePct: input.slippagePct,
   });
   if ("error" in sized) return { action: "skip", reason: sized.error };
+  if (input.dailyLossUsd != null && input.dayPnl != null) {
+    const remaining = remainingLossBudget(input.dailyLossUsd, input.dayPnl);
+    const openRisk = open.reduce((sum, position) => sum + riskToStop(position), 0);
+    if (openRisk + sized.riskAmount > remaining + 1e-9) {
+      return {
+        action: "skip",
+        reason: `risco aberto US$ ${openRisk.toFixed(2)} + novo US$ ${sized.riskAmount.toFixed(2)} passa do limite diário restante US$ ${remaining.toFixed(2)}`,
+      };
+    }
+  }
   const via = stop.source === "publico" ? "stop público do trader" : "stop por ATR da Binance";
   const cap = sized.cappedToCash ? " Tamanho limitado ao caixa, 1x, sem alavancagem." : " Tamanho recalculado. Sem alavancagem.";
   return {
@@ -256,6 +311,10 @@ export function winStreak(pnls: number[]): number {
 }
 
 export function skipLabel(reason: string): string {
+  if (/pausada/i.test(reason)) return "cópia pausada";
+  if (/já há posição aberta/i.test(reason)) return "1 posição por moeda";
+  if (/posições abertas ao mesmo tempo/i.test(reason)) return "máximo de posições abertas";
+  if (/risco aberto/i.test(reason)) return "risco aberto acima do limite restante";
   if (/atrasado/i.test(reason)) return "dado atrasado";
   if (/desvi/i.test(reason)) return "preço divergente";
   if (/perdedora|médio|media/i.test(reason)) return "médio para baixo";

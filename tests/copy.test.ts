@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendFillPoint, chooseStop, classifyFill, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, sizeCopy, skipLabel, winStreak, type DecideInput } from "../src/domain/copy.js";
+import { appendFillPoint, chooseStop, classifyFill, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, remainingLossBudget, riskToStop, sizeCopy, skipLabel, winStreak, type DecideInput } from "../src/domain/copy.js";
 import { parseCopySeed, RISK_VERDICT } from "../src/domain/copySeed.js";
 
 const fresh = Date.now();
@@ -139,3 +139,67 @@ inadequado para copiar, margem 100% usada
     expect(classifyFill("Close Short")).toBe("close-short");
   });
 });
+
+describe("regras de risco da cópia (pausa, 1 por moeda, risco aberto)", () => {
+  const long = (coin: string, mark = 100, stop = 98, qty = 2) => ({ coin, side: "BUY" as const, qty, stop, entry: 100, mark });
+
+  it("pausa bloqueia entrada nova, mas deixa a saída passar", () => {
+    const entry = decideCopy(input({ paused: true }));
+    expect(entry).toEqual({ action: "skip", reason: "cópia pausada (sem novas entradas)" });
+    expect(decideCopy(input({ paused: true, kind: "close-long" })).action).toBe("exit");
+    expect(skipLabel("cópia pausada (sem novas entradas)")).toBe("cópia pausada");
+  });
+
+  it("no máximo 1 posição por moeda: não adiciona nem faz preço médio, nem do lado oposto", () => {
+    const open = [long("BTC")];
+    const same = decideCopy(input({ openPositions: open, sameSideOpen: true, unrealizedPnl: 3 }));
+    expect(same.action).toBe("skip");
+    expect(same.action === "skip" && same.reason).toMatch(/já há posição aberta em BTC/);
+    const opposite = decideCopy(input({ openPositions: open, kind: "open-short" }));
+    expect(opposite.action).toBe("skip");
+    expect(decideCopy(input({ openPositions: [long("ETH")], dayPnl: 0, dailyLossUsd: 15 })).action).toBe("enter");
+  });
+
+  it("no máximo 2 posições abertas ao mesmo tempo", () => {
+    const two = [long("ETH"), long("SOL")];
+    const blocked = decideCopy(input({ openPositions: two, maxOpenPositions: 2 }));
+    expect(blocked.action === "skip" && blocked.reason).toMatch(/2 posições abertas/);
+    expect(decideCopy(input({ openPositions: [long("ETH")], maxOpenPositions: 2, dayPnl: 0, dailyLossUsd: 15 })).action).toBe("enter");
+  });
+
+  it("limite diário restante = limite − perda já tomada (realizado + aberto)", () => {
+    expect(remainingLossBudget(15, 0)).toBe(15);
+    expect(remainingLossBudget(15, 4)).toBe(15);
+    expect(remainingLossBudget(15, -13.3)).toBeCloseTo(1.7, 6);
+    expect(remainingLossBudget(15, -20)).toBe(0);
+  });
+
+  it("risco aberto total nunca passa do limite diário restante", () => {
+    const open = [long("ETH", 100, 98, 2)]; // risco ao stop ≈ 4 + taxa
+    const risk = riskToStop(open[0]);
+    expect(risk).toBeGreaterThan(4);
+    expect(risk).toBeLessThan(4.5);
+    const ok = decideCopy(input({ openPositions: open, dayPnl: 0, dailyLossUsd: 15 }));
+    expect(ok.action).toBe("enter"); // 4,2 + 5 < 15
+    const tight = decideCopy(input({ openPositions: open, dayPnl: -8, dailyLossUsd: 15 })); // restante 7 < 4,2 + 5
+    expect(tight.action).toBe("skip");
+    expect(tight.action === "skip" && tight.reason).toMatch(/risco aberto/);
+    const none = decideCopy(input({ openPositions: [], dayPnl: -11, dailyLossUsd: 15 })); // restante 4 < 5 novo
+    expect(none.action).toBe("skip");
+  });
+
+  it("o risco ao stop usa o preço atual: posição já no prejuízo tem menos risco restante", () => {
+    const fresh = riskToStop(long("ETH", 100, 98, 2));
+    const losing = riskToStop(long("ETH", 98.5, 98, 2));
+    expect(losing).toBeLessThan(fresh);
+    expect(riskToStop(long("ETH", 97, 98, 2))).toBeCloseTo(98 * 2 * 0.001, 8); // já além do stop: só a taxa
+  });
+
+  it("a trava de perda diária usa realizado + aberto (dayPnl marcado a mercado)", () => {
+    const locked = copySessionBlock({ dayPnl: -15.01, dailyLossUsd: 15, dailyTargetUsd: 20, latched: null });
+    expect(locked.blocked).toBe("loss");
+    expect(copySessionBlock({ dayPnl: -14.99, dailyLossUsd: 15, dailyTargetUsd: 20, latched: null }).blocked).toBeNull();
+    expect(decideCopy(input({ blocked: "loss" })).action).toBe("skip");
+  });
+});
+

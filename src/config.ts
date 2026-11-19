@@ -17,6 +17,8 @@ export interface AppConfig {
   telegramChat: string | null;
   accessToken: string | null;
   accessTokenSha256: string | null;
+  /** Padrão da pausa da cópia quando não há valor gravado no SQLite (COPY_PAUSED=true). */
+  copyPausedDefault: boolean;
 }
 
 function num(value: string | undefined, fallback: number): number {
@@ -49,5 +51,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramChat: clean(env.TELEGRAM_CHAT_ID),
     accessToken: clean(env.DESK_ACCESS_TOKEN),
     accessTokenSha256: clean(env.DESK_ACCESS_TOKEN_SHA256),
+    copyPausedDefault: /^(1|true|yes|on|sim)$/i.test(env.COPY_PAUSED?.trim() ?? ""),
   };
 }

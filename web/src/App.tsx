@@ -480,8 +480,35 @@ function CopyPanel({ state }: { state: DashboardState }) {
         <Button onClick={() => void follow(address)}>Seguir</Button>
         <button className={copy.settings.mode === "separate" ? "on" : ""} onClick={() => void saveMode("separate")}>Caixa separado</button>
         <button className={copy.settings.mode === "shared" ? "on" : ""} onClick={() => void saveMode("shared")}>Caixa da mesa</button>
+        <button
+          className={copy.paused ? "on" : ""}
+          title="Pausa só as entradas novas. Stops e saídas continuam."
+          onClick={() =>
+            void fetch("/api/copy/pause", {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ paused: !copy.paused }),
+            })
+          }
+        >
+          {copy.paused ? "Cópia PAUSADA · retomar" : "Pausar cópia"}
+        </button>
+        <button
+          title="Fecha a mercado (simulado) todas as posições copiadas abertas"
+          onClick={() => {
+            if (window.confirm("Fechar a mercado (simulado) todas as posições copiadas abertas?")) void fetch("/api/copy/close-all", { method: "POST" });
+          }}
+        >
+          Fechar tudo
+        </button>
         <button onClick={() => void fetch("/api/copy/reset", { method: "POST" })}>Zerar</button>
       </div>
+      {copy.paused && (
+        <p className="banner">
+          Cópia PAUSADA: sem novas entradas. Stops e saídas continuam. Regras: máx. {copy.settings.maxOpenPositions} posições abertas, 1 por moeda, risco aberto total dentro do limite diário restante
+          {copy.remainingLossUsd == null ? "" : ` (restante ${usd(copy.remainingLossUsd)})`}.
+        </p>
+      )}
       {error && <p className="banner">{error}</p>}
       {copy.suggestions.length > 0 && (
         <div className="copy-tools">

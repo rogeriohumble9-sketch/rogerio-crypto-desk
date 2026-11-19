@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import type { AppConfig } from "../config.js";
 import type { DeskDb } from "../db.js";
 import { atr as atrOf } from "../domain/indicators.js";
-import { COPY_DEFAULTS, appendFillPoint, classifyFill, closeCash, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, skipLabel, unrealizedCopy, winStreak } from "../domain/copy.js";
+import { COPY_DEFAULTS, remainingLossBudget, riskToStop, appendFillPoint, classifyFill, closeCash, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, skipLabel, unrealizedCopy, winStreak } from "../domain/copy.js";
 import { applyRiskVerdict, parseCopySeed, RISK_VERDICT, type SeedBlocked, type SeedWatch } from "../domain/copySeed.js";
 import { readNote } from "../financas.js";
 import type { Logger } from "../log.js";
@@ -167,8 +167,13 @@ export class CopyDesk {
     const curve = this.book.curve;
     const lastFillEquity = curve.length ? curve[curve.length - 1].equity : null;
     const wins = this.book.closed.filter((item) => item.pnl > 0).length;
+    const openRisk = this.openRiskUsd();
     return {
       settings: this.settings,
+      paused: this.isPaused(),
+      pausedSource: this.db.getCopyBlob("copyPaused") == null ? "env" : "salvo",
+      openRiskUsd: openRisk,
+      remainingLossUsd: dayPnl == null ? null : remainingLossBudget(this.settings.dailyLossUsd, dayPnl),
       cash: this.settings.mode === "shared" ? this.sim.freeCash() : this.book.cash,
       equity,
       totalPnl: lastFillEquity == null ? null : lastFillEquity - this.settings.initialCapital,
@@ -229,6 +234,53 @@ export class CopyDesk {
     this.resubscribe();
   }
 
+  isPaused(): boolean {
+    const saved = this.db.getCopyBlob("copyPaused");
+    if (saved != null) return saved === "on";
+    return this.config.copyPausedDefault;
+  }
+
+  /** Pausa só as ENTRADAS novas. Saídas copiadas, stops e fechamento manual continuam valendo. */
+  setPaused(paused: boolean): void {
+    this.db.saveCopyBlob("copyPaused", paused ? "on" : "off");
+    this.logEvent(null, null, "SYNC", paused ? "Cópia PAUSADA: sem novas entradas. Stops e saídas continuam." : "Cópia RETOMADA: novas entradas liberadas (sujeitas às regras de risco).");
+  }
+
+  /** Fecha a mercado (simulado) todas as posições copiadas abertas, de um trader ou de todos. */
+  closeAll(address?: string, reason = "fechamento manual a mercado (Risk Manager)"): { closed: { id: string; address: string; coin: string; side: "BUY" | "SELL"; qty: number; entry: number; exit: number; pnl: number }[]; failed: string[]; totalPnl: number; equityAfter: number | null } {
+    const target = address?.trim().toLowerCase();
+    const closed: { id: string; address: string; coin: string; side: "BUY" | "SELL"; qty: number; entry: number; exit: number; pnl: number }[] = [];
+    const failed: string[] = [];
+    for (const position of [...this.book.positions]) {
+      if (target && position.address.toLowerCase() !== target) continue;
+      const mark = this.market.price(`${position.coin}USDT`) ?? position.lastMark;
+      if (mark == null) {
+        failed.push(`${position.coin}: sem preço da Binance`);
+        continue;
+      }
+      const qty = position.qty;
+      const exit = exitFill(position.side, mark);
+      const pnl = this.closePosition(position, mark, "EXIT", reason);
+      closed.push({ id: position.id, address: position.address, coin: position.coin, side: position.side, qty, entry: position.entry, exit, pnl });
+    }
+    this.applyDailyLatch();
+    return { closed, failed, totalPnl: closed.reduce((sum, item) => sum + item.pnl, 0), equityAfter: this.equity() };
+  }
+
+  private dayPnlNow(): number | null {
+    const equity = this.equity();
+    return equity == null ? null : equity - this.book.sessionStartEquity;
+  }
+
+  private openRiskUsd(): number | null {
+    let total = 0;
+    for (const position of this.book.positions) {
+      const mark = this.market.price(`${position.coin}USDT`) ?? position.lastMark;
+      total += riskToStop({ coin: position.coin, side: position.side, qty: position.qty, stop: position.stop, entry: position.entry, mark });
+    }
+    return total;
+  }
+
   updateSettings(patch: Partial<CopySettings>): { ok: true; value: CopySettings } | { ok: false; error: string } {
     const next: CopySettings = { ...this.settings, ...patch };
     if (next.mode !== "separate" && next.mode !== "shared") return { ok: false, error: "Modo inválido." };
@@ -238,6 +290,7 @@ export class CopyDesk {
     if (!(next.dailyTargetUsd >= 1 && next.dailyTargetUsd <= 5_000)) return { ok: false, error: "Meta diária da cópia fora da faixa." };
     if (!(next.maxFillAgeMs >= 5_000 && next.maxFillAgeMs <= 600_000)) return { ok: false, error: "Atraso máximo fora da faixa." };
     if (!(next.maxDeviationPct >= 0.05 && next.maxDeviationPct <= 5)) return { ok: false, error: "Desvio máximo fora da faixa." };
+    if (!(Number.isInteger(next.maxOpenPositions) && next.maxOpenPositions >= 1 && next.maxOpenPositions <= 10)) return { ok: false, error: "Máximo de posições abertas fora da faixa." };
     const switched = next.mode !== this.settings.mode;
     this.settings = next;
     this.db.saveCopyBlob("copySettings", JSON.stringify(next));
@@ -500,6 +553,13 @@ export class CopyDesk {
       binancePrice: mark,
       maxDeviationPct: this.settings.maxDeviationPct,
       blocked: this.book.latched,
+      paused: this.isPaused(),
+      dayPnl: this.dayPnlNow() ?? undefined,
+      dailyLossUsd: this.settings.dailyLossUsd,
+      maxOpenPositions: this.settings.maxOpenPositions,
+      openPositions: this.book.positions
+        .filter((item) => item.qty > 0)
+        .map((item) => ({ coin: item.coin, side: item.side, qty: item.qty, stop: item.stop, entry: item.entry, mark: this.market.price(`${item.coin}USDT`) ?? item.lastMark })),
       sameSideOpen: Boolean(position && ((kind === "open-long" && position.side === "BUY") || (kind === "open-short" && position.side === "SELL"))),
       unrealizedPnl: unrealized,
       publicStop: this.cache.get(address)?.stops.get(coin) ?? null,

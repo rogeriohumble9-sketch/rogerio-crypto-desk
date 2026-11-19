@@ -252,6 +252,7 @@ export interface CopySettings {
   dailyTargetUsd: number;
   maxFillAgeMs: number;
   maxDeviationPct: number;
+  maxOpenPositions: number;
 }
 
 export interface CopyTraderView {
@@ -357,6 +358,10 @@ export interface CopyWatchView {
 
 export interface CopyView {
   settings: CopySettings;
+  paused: boolean;
+  pausedSource: "salvo" | "env";
+  openRiskUsd: number | null;
+  remainingLossUsd: number | null;
   cash: number;
   equity: number | null;
   totalPnl: number | null;

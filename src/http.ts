@@ -73,6 +73,8 @@ export async function listenHttp(opts: {
       if (req.method === "POST" && url.pathname === "/api/copy/traders") return addCopy(req, res);
       if (req.method === "DELETE" && url.pathname.startsWith("/api/copy/traders/")) return removeCopy(res, decodeURIComponent(url.pathname.split("/").pop() ?? ""));
       if (req.method === "PUT" && url.pathname === "/api/copy/settings") return updateCopy(req, res);
+      if (req.method === "PUT" && url.pathname === "/api/copy/pause") return pauseCopy(req, res);
+      if (req.method === "POST" && url.pathname === "/api/copy/close-all") return closeAllCopy(req, res);
       if (req.method === "POST" && url.pathname === "/api/copy/reset") {
         opts.copy.reset();
         return json(res, 200, { ok: true });
@@ -233,6 +235,19 @@ export async function listenHttp(opts: {
     json(res, 200, { ok: true });
   }
 
+  async function pauseCopy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readBody(req);
+    if (typeof body.paused !== "boolean") return json(res, 400, { error: "Envie {\"paused\": true|false}." });
+    opts.copy.setPaused(body.paused);
+    json(res, 200, { paused: opts.copy.isPaused() });
+  }
+
+  async function closeAllCopy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readBody(req);
+    const address = body.address == null ? undefined : String(body.address);
+    json(res, 200, opts.copy.closeAll(address));
+  }
+
   async function updateCopy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await readBody(req);
     const patch: Parameters<CopyDesk["updateSettings"]>[0] = {};
@@ -243,6 +258,7 @@ export async function listenHttp(opts: {
     if (body.dailyTargetUsd != null) patch.dailyTargetUsd = Number(body.dailyTargetUsd);
     if (body.maxFillAgeMs != null) patch.maxFillAgeMs = Number(body.maxFillAgeMs);
     if (body.maxDeviationPct != null) patch.maxDeviationPct = Number(body.maxDeviationPct);
+    if (body.maxOpenPositions != null) patch.maxOpenPositions = Number(body.maxOpenPositions);
     const result = opts.copy.updateSettings(patch);
     if (!result.ok) return json(res, 400, { error: result.error });
     json(res, 200, result.value);
