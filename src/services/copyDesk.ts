@@ -2,7 +2,8 @@ import WebSocket from "ws";
 import type { AppConfig } from "../config.js";
 import type { DeskDb } from "../db.js";
 import { atr as atrOf } from "../domain/indicators.js";
-import { COPY_DEFAULTS, remainingLossBudget, riskToStop, appendFillPoint, classifyFill, closeCash, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, skipLabel, unrealizedCopy, winStreak } from "../domain/copy.js";
+import { startupGuard, RecoveryGate } from "../domain/guard.js";
+import { COPY_DEFAULTS, entryFeeShare, reconcileEntryFees, remainingLossBudget, riskToStop, appendFillPoint, classifyFill, closeCash, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, skipLabel, unrealizedCopy, winStreak } from "../domain/copy.js";
 import { applyRiskVerdict, parseCopySeed, RISK_VERDICT, type SeedBlocked, type SeedWatch } from "../domain/copySeed.js";
 import { readNote } from "../financas.js";
 import type { Logger } from "../log.js";
@@ -40,6 +41,7 @@ interface Book {
   curve: CopyCurvePoint[];
   closed: { address: string; pnl: number; ts: number }[];
   realized: Record<string, number>;
+  feesReconciled?: boolean;
 }
 
 interface TraderCache {
@@ -95,6 +97,7 @@ export class CopyDesk {
   private mids: Record<string, number> = {};
   private midsAt = 0;
   private timers: NodeJS.Timeout[] = [];
+  private readonly gate = new RecoveryGate();
 
   constructor(
     private readonly config: AppConfig,
@@ -135,6 +138,7 @@ export class CopyDesk {
       this.book.sessionStartEquity = this.book.cash;
       this.persistBook();
     }
+    this.reconcileFees();
     this.traders = this.db.listCopyTraders();
     this.events = this.db.recentCopyEvents(80).map((event) => ({
       ...event,
@@ -170,6 +174,7 @@ export class CopyDesk {
     const openRisk = this.openRiskUsd();
     return {
       settings: this.settings,
+      suspendedTraders: this.suspendedList(),
       paused: this.isPaused(),
       pausedSource: this.db.getCopyBlob("copyPaused") == null ? "env" : "salvo",
       openRiskUsd: openRisk,
@@ -240,6 +245,35 @@ export class CopyDesk {
     return this.config.copyPausedDefault;
   }
 
+  suspendedList(): string[] {
+    const saved = this.db.getCopyBlob("copySuspended");
+    if (saved != null) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed.map((item) => String(item).toLowerCase());
+      } catch {
+        /* valor gravado inválido: cai no padrão do ambiente */
+      }
+    }
+    return this.config.copySuspendedDefault;
+  }
+
+  isSuspended(address: string): boolean {
+    return this.suspendedList().includes(address.trim().toLowerCase());
+  }
+
+  /** Suspende ou reativa a cópia de um trader. A pausa geral não reativa um trader suspenso. */
+  setSuspended(raw: string, suspended: boolean): { ok: true; suspended: string[] } | { ok: false; error: string } {
+    const address = raw.trim().toLowerCase();
+    if (!/^0x[a-f0-9]{40}$/.test(address)) return { ok: false, error: "Endereço público inválido." };
+    const next = new Set(this.suspendedList());
+    if (suspended) next.add(address);
+    else next.delete(address);
+    this.db.saveCopyBlob("copySuspended", JSON.stringify([...next]));
+    this.logEvent(address, null, "SYNC", suspended ? "Trader SUSPENSO até revisão do Risk Manager: sem novas entradas. Saídas e stops continuam." : "Trader REATIVADO pelo Risk Manager.");
+    return { ok: true, suspended: [...next] };
+  }
+
   /** Pausa só as ENTRADAS novas. Saídas copiadas, stops e fechamento manual continuam valendo. */
   setPaused(paused: boolean): void {
     this.db.saveCopyBlob("copyPaused", paused ? "on" : "off");
@@ -265,6 +299,42 @@ export class CopyDesk {
     }
     this.applyDailyLatch();
     return { closed, failed, totalPnl: closed.reduce((sum, item) => sum + item.pnl, 0), equityAfter: this.equity() };
+  }
+
+  /** Na partida e a cada volta dos preços: com o dia perto do limite e posições abertas, fecha tudo a mercado. */
+  private runRecoveryGuard(): void {
+    const equity = this.equity();
+    if (!this.gate.observe(equity != null)) return;
+    if (equity == null || !this.book.positions.length) return;
+    const decision = startupGuard({
+      dailyLossUsd: this.settings.dailyLossUsd,
+      dayPnl: equity - this.book.sessionStartEquity,
+      openRiskUsd: this.openRiskUsd() ?? 0,
+      openCount: this.book.positions.length,
+    });
+    if (!decision.close || !decision.reason) return;
+    this.logEvent(null, null, "EXIT", `${decision.reason}. Fechando tudo a mercado (simulado), sem esperar ordem.`);
+    this.closeAll(undefined, decision.reason);
+  }
+
+  /** Migração única das taxas de entrada que ficaram fora do P&L registrado. */
+  private reconcileFees(): void {
+    if (this.book.feesReconciled) return;
+    if (this.settings.mode === "separate" && this.book.positions.length === 0) {
+      const result = reconcileEntryFees(this.book.closed, this.book.realized, this.settings.initialCapital, this.book.cash);
+      if (result) {
+        this.book.closed = result.closed;
+        this.book.realized = result.realized;
+        this.book.feesReconciled = true;
+        this.persistBook();
+        this.logEvent(null, null, "SYNC", `P&L dos fechados corrigido: taxas de entrada de US$ ${result.missingFees.toFixed(2)} agora incluídas, igual ao patrimônio e à trava diária.`);
+        return;
+      }
+    }
+    if (this.book.positions.length === 0) {
+      this.book.feesReconciled = true;
+      this.persistBook();
+    }
   }
 
   private dayPnlNow(): number | null {
@@ -553,6 +623,7 @@ export class CopyDesk {
       binancePrice: mark,
       maxDeviationPct: this.settings.maxDeviationPct,
       blocked: this.book.latched,
+      suspended: this.isSuspended(address),
       paused: this.isPaused(),
       dayPnl: this.dayPnlNow() ?? undefined,
       dailyLossUsd: this.settings.dailyLossUsd,
@@ -648,18 +719,21 @@ export class CopyDesk {
     const exit = exitFill(position.side, rawExit);
     const closed = closeCash(position.side, position.entry, exit, qty, 0.1);
     this.addCash(closed.cashDelta);
-    this.book.realized[position.address] = (this.book.realized[position.address] ?? 0) + closed.pnl;
-    this.book.closed.push({ address: position.address, pnl: closed.pnl, ts: Date.now() });
+    // O P&L registrado inclui a taxa de entrada do trecho fechado (ela já saiu do caixa na abertura), como o patrimônio e a trava diária.
+    const netPnl = closed.pnl - entryFeeShare(position.entry, qty);
+    this.book.realized[position.address] = (this.book.realized[position.address] ?? 0) + netPnl;
+    this.book.closed.push({ address: position.address, pnl: netPnl, ts: Date.now() });
     position.qty = Math.max(0, position.qty - qty);
     if (position.qty <= 1e-10) this.book.positions = this.book.positions.filter((item) => item.id !== position.id);
     this.recordFill(`exit:${position.id}:${this.book.closed.length}`);
     this.persistBook();
-    this.stampPnl(position.address, position.coin, closed.pnl);
-    this.logEvent(position.address, position.coin, action, `${reason} P&L US$ ${closed.pnl.toFixed(2)}.`);
-    return closed.pnl;
+    this.stampPnl(position.address, position.coin, netPnl);
+    this.logEvent(position.address, position.coin, action, `${reason} P&L líquido (com taxa de entrada) US$ ${netPnl.toFixed(2)}.`);
+    return netPnl;
   }
 
   private markStops(): void {
+    this.runRecoveryGuard();
     for (const position of [...this.book.positions]) {
       const mark = this.market.price(`${position.coin}USDT`);
       if (mark == null) continue;
@@ -768,6 +842,7 @@ export class CopyDesk {
     const midsFresh = this.midsAt > 0 && Date.now() - this.midsAt <= FEED_STALE_MS;
     return {
       address,
+      suspended: this.isSuspended(address),
       displayName: cache?.displayName ?? null,
       accountValue: cache?.accountValue ?? null,
       dayPnl: cache?.dayPnl ?? null,

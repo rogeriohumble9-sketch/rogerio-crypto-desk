@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendFillPoint, chooseStop, classifyFill, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, remainingLossBudget, riskToStop, sizeCopy, skipLabel, winStreak, type DecideInput } from "../src/domain/copy.js";
+import { appendFillPoint, chooseStop, classifyFill, coinAllowed, copySessionBlock, decideCopy, drawdownFromPoints, remainingLossBudget, riskToStop, entryFeeShare, reconcileEntryFees, sizeCopy, skipLabel, winStreak, type DecideInput } from "../src/domain/copy.js";
 import { parseCopySeed, RISK_VERDICT } from "../src/domain/copySeed.js";
 
 const fresh = Date.now();
@@ -200,6 +200,44 @@ describe("regras de risco da cópia (pausa, 1 por moeda, risco aberto)", () => {
     expect(locked.blocked).toBe("loss");
     expect(copySessionBlock({ dayPnl: -14.99, dailyLossUsd: 15, dailyTargetUsd: 20, latched: null }).blocked).toBeNull();
     expect(decideCopy(input({ blocked: "loss" })).action).toBe("skip");
+  });
+});
+
+describe("suspensão por trader e taxas de entrada", () => {
+  it("trader suspenso não abre entrada, mas a saída copiada passa, mesmo com a cópia despausada", () => {
+    const entry = decideCopy(input({ suspended: true, paused: false }));
+    expect(entry.action).toBe("skip");
+    expect(entry.action === "skip" && entry.reason).toMatch(/suspenso/);
+    expect(decideCopy(input({ suspended: true, paused: false, kind: "close-long" })).action).toBe("exit");
+    expect(decideCopy(input({ suspended: false, paused: false, dayPnl: 0, dailyLossUsd: 15 })).action).toBe("enter");
+    expect(skipLabel("trader suspenso até revisão do Risk Manager (sem novas entradas)")).toBe("trader suspenso");
+  });
+
+  it("a taxa de entrada entra no P&L registrado (0,1% do notional de entrada)", () => {
+    expect(entryFeeShare(100, 10)).toBeCloseTo(1, 8);
+    expect(entryFeeShare(61628.6718, 0.00495)).toBeCloseTo(0.305, 3);
+  });
+
+  it("migração: distribui a taxa de entrada que faltava e fecha com o caixa", () => {
+    const closed = [
+      { address: "0xa", pnl: -1.0163, ts: 1 },
+      { address: "0xa", pnl: -3.8642, ts: 2 },
+      { address: "0xa", pnl: -3.9179, ts: 3 },
+      { address: "0xa", pnl: -2.7518, ts: 4 },
+      { address: "0xa", pnl: -3.1624, ts: 5 },
+    ];
+    const cash = 983.8744394;
+    const result = reconcileEntryFees(closed, { "0xa": -14.7126 }, 1000, cash);
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.closed).toHaveLength(5);
+    const sum = result.closed.reduce((total, item) => total + item.pnl, 0);
+    expect(1000 + sum).toBeCloseTo(cash, 6);
+    expect(result.realized["0xa"]).toBeCloseTo(sum, 8);
+    expect(result.missingFees).toBeCloseTo(1.4130, 3);
+    expect(result.closed.every((item) => item.pnl < 0)).toBe(true);
+    // já reconciliado: nada a fazer
+    expect(reconcileEntryFees(result.closed, result.realized, 1000, cash)).toBeNull();
   });
 });
 

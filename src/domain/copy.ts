@@ -164,6 +164,8 @@ export interface DecideInput {
   binancePrice: number | null;
   maxDeviationPct: number;
   blocked: null | "loss" | "profit";
+  /** Trader suspenso até revisão do Risk Manager: sem entradas novas dele, independente da pausa geral. */
+  suspended?: boolean;
   /** Pausa manual do módulo de cópia: sem entradas novas. Saídas e stops continuam. */
   paused?: boolean;
   /** P&L do dia = realizado + aberto (patrimônio atual − patrimônio no início da sessão). */
@@ -222,6 +224,7 @@ export function decideCopy(input: DecideInput): CopyDecision {
   if (deviation > input.maxDeviationPct) {
     return { action: "skip", reason: `preço Hyperliquid desviou ${deviation.toFixed(2)}% da Binance (máx. ${input.maxDeviationPct}%)` };
   }
+  if (input.suspended) return { action: "skip", reason: "trader suspenso até revisão do Risk Manager (sem novas entradas)" };
   if (input.paused) return { action: "skip", reason: "cópia pausada (sem novas entradas)" };
   if (input.blocked === "loss" || input.blocked === "profit") {
     return { action: "skip", reason: input.blocked === "loss" ? "limite de perda diária da cópia" : "meta diária da cópia atingida" };
@@ -311,6 +314,7 @@ export function winStreak(pnls: number[]): number {
 }
 
 export function skipLabel(reason: string): string {
+  if (/suspenso/i.test(reason)) return "trader suspenso";
   if (/pausada/i.test(reason)) return "cópia pausada";
   if (/já há posição aberta/i.test(reason)) return "1 posição por moeda";
   if (/posições abertas ao mesmo tempo/i.test(reason)) return "máximo de posições abertas";
@@ -338,4 +342,39 @@ export function closeCash(side: "BUY" | "SELL", entry: number, exit: number, qty
   const pnl = side === "BUY" ? (fill - entry) * qty - fee : (entry - fill) * qty - fee;
   const cashDelta = side === "BUY" ? fill * qty - fee : -(fill * qty + fee);
   return { cashDelta, pnl, fee };
+}
+
+
+/** Taxa de entrada do trecho fechado. A taxa de entrada vai para o caixa na abertura; o P&L registrado precisa carregá-la. */
+export function entryFeeShare(entry: number, qtyClosed: number, feePctPerSide = 0.1): number {
+  return Math.abs(entry * qtyClosed) * (feePctPerSide / 100);
+}
+
+export interface ClosedCopy {
+  address: string;
+  pnl: number;
+  ts: number;
+}
+
+/**
+ * Migração única: trades fechados antes desta versão não guardavam a taxa de entrada no P&L.
+ * Sem posições abertas, caixa = capital + soma dos P&L líquidos, então a taxa que falta é capital − caixa + soma(P&L).
+ * Distribui essa diferença nos fechados em proporção ao |P&L|, sem mudar a contagem de trades.
+ */
+export function reconcileEntryFees(
+  closed: ClosedCopy[],
+  realized: Record<string, number>,
+  initialCapital: number,
+  cash: number,
+): { closed: ClosedCopy[]; realized: Record<string, number>; missingFees: number } | null {
+  if (!closed.length) return null;
+  const sum = closed.reduce((total, item) => total + item.pnl, 0);
+  const missing = cash - (initialCapital + sum); // negativo = taxa de entrada ainda fora do P&L
+  if (!(missing < -0.005) || missing < -0.2 * initialCapital) return null;
+  const weight = closed.reduce((total, item) => total + Math.abs(item.pnl), 0) || closed.length;
+  const next = closed.map((item) => ({ ...item, pnl: item.pnl + missing * ((Math.abs(item.pnl) || 1) / weight) }));
+  const nextRealized: Record<string, number> = { ...realized };
+  for (const key of Object.keys(nextRealized)) nextRealized[key] = 0;
+  for (const item of next) nextRealized[item.address] = (nextRealized[item.address] ?? 0) + item.pnl;
+  return { closed: next, realized: nextRealized, missingFees: -missing };
 }

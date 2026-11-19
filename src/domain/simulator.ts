@@ -2,10 +2,10 @@ import { exitFillPrice, entryFillPrice } from "./risk.js";
 import { round } from "./indicators.js";
 
 export type Side = "BUY" | "SELL";
-export type CloseReason = "SL" | "TP2";
+export type CloseReason = "SL" | "TP2" | "MANUAL";
 
 export interface FillEvent {
-  kind: "OPEN" | "TP1" | "TP2" | "SL";
+  kind: "OPEN" | "TP1" | "TP2" | "SL" | "MANUAL";
   qty: number;
   price: number;
   fee: number;
@@ -75,7 +75,7 @@ function closeQty(
   position: SimPosition,
   qty: number,
   rawPrice: number,
-  kind: "TP1" | "TP2" | "SL",
+  kind: "TP1" | "TP2" | "SL" | "MANUAL",
   feePctPerSide: number,
   slippagePct: number,
 ): { position: SimPosition; cashDelta: number; event: FillEvent } {
@@ -93,10 +93,29 @@ function closeQty(
     realizedPnl: position.realizedPnl + pnl,
     tp1Hit: position.tp1Hit || kind === "TP1",
     status: qtyOpen <= 1e-10 ? "closed" : "open",
-    closeReason: qtyOpen <= 1e-10 ? (kind === "SL" ? "SL" : "TP2") : position.closeReason,
+    closeReason: qtyOpen <= 1e-10 ? (kind === "SL" ? "SL" : kind === "MANUAL" ? "MANUAL" : "TP2") : position.closeReason,
   };
   if (next.status === "closed") next.qtyOpen = 0;
   return { position: next, cashDelta, event: { kind, qty: qtyClose, price: fill, fee, pnl } };
+}
+
+/** Fecha o que resta da posição ao preço de mercado (com slippage e taxa), sem esperar stop ou alvo. */
+export function closeAtMarket(
+  position: SimPosition,
+  mark: number,
+  feePctPerSide: number,
+  slippagePct: number,
+): { position: SimPosition; cashDelta: number; event: FillEvent } | null {
+  if (position.status === "closed" || position.qtyOpen <= 0) return null;
+  return closeQty(position, position.qtyOpen, mark, "MANUAL", feePctPerSide, slippagePct);
+}
+
+/** Perda adicional possível até o stop a partir do preço atual, com a taxa de saída. Sem preço, parte da entrada. */
+export function riskToStopFromMark(position: SimPosition, mark: number | null, feePctPerSide: number): number {
+  if (position.status === "closed" || position.qtyOpen <= 0) return 0;
+  const ref = mark ?? position.entryFill;
+  const distance = position.side === "BUY" ? ref - position.stop : position.stop - ref;
+  return Math.max(0, distance) * position.qtyOpen + position.stop * position.qtyOpen * (feePctPerSide / 100);
 }
 
 /**

@@ -310,3 +310,4 @@ th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line
   .agents { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; }
   .agent { min-width: 220px; scroll-snap-align: start; }
 }
+.copy-cards article.blocked .suspended { display: block; color: #ff9d9d; margin-top: 2px; }

@@ -74,6 +74,8 @@ export async function listenHttp(opts: {
       if (req.method === "DELETE" && url.pathname.startsWith("/api/copy/traders/")) return removeCopy(res, decodeURIComponent(url.pathname.split("/").pop() ?? ""));
       if (req.method === "PUT" && url.pathname === "/api/copy/settings") return updateCopy(req, res);
       if (req.method === "PUT" && url.pathname === "/api/copy/pause") return pauseCopy(req, res);
+      if (req.method === "PUT" && url.pathname === "/api/copy/suspend") return suspendCopy(req, res);
+      if (req.method === "POST" && url.pathname === "/api/simulator/close-all") return json(res, 200, opts.sim.closeAllAtMarket());
       if (req.method === "POST" && url.pathname === "/api/copy/close-all") return closeAllCopy(req, res);
       if (req.method === "POST" && url.pathname === "/api/copy/reset") {
         opts.copy.reset();
@@ -240,6 +242,14 @@ export async function listenHttp(opts: {
     if (typeof body.paused !== "boolean") return json(res, 400, { error: "Envie {\"paused\": true|false}." });
     opts.copy.setPaused(body.paused);
     json(res, 200, { paused: opts.copy.isPaused() });
+  }
+
+  async function suspendCopy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readBody(req);
+    if (typeof body.suspended !== "boolean") return json(res, 400, { error: "Envie {\"address\":\"0x…\",\"suspended\":true|false}." });
+    const result = opts.copy.setSuspended(String(body.address ?? ""), body.suspended);
+    if (!result.ok) return json(res, 400, { error: result.error });
+    json(res, 200, { suspended: result.suspended });
   }
 
   async function closeAllCopy(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

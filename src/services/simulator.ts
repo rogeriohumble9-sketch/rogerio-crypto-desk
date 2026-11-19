@@ -1,6 +1,7 @@
 import type { DeskDb, SimPersisted, TradeRow } from "../db.js";
 import { usdLimit, sessionDecision } from "../domain/risk.js";
-import { applyBar, openPosition, openRiskAmount, positionMarketValue, unrealizedPnl, type SimPosition } from "../domain/simulator.js";
+import { applyBar, closeAtMarket, openPosition, openRiskAmount, positionMarketValue, riskToStopFromMark, unrealizedPnl, type SimPosition } from "../domain/simulator.js";
+import { RecoveryGate, startupGuard } from "../domain/guard.js";
 import type { SizeResult } from "../domain/risk.js";
 import { sessionDate, sessionMonth, sessionWeekKey } from "../shared/time.js";
 import { startOfCivilDay } from "../domain/reports.js";
@@ -27,6 +28,7 @@ export class Simulator {
   private readonly watermarks = new Map<string, { high: number; low: number }>();
   private lastSnap = 0;
   private activity: ActivityFn = () => undefined;
+  private readonly gate = new RecoveryGate();
 
   constructor(
     private readonly db: DeskDb,
@@ -206,6 +208,7 @@ export class Simulator {
   tick(): void {
     if (!this.ready) return;
     this.rollSession();
+    this.runRecoveryGuard();
     for (const trade of this.openTrades()) {
       const mark = this.market.price(trade.symbol);
       if (mark == null) continue;
@@ -289,6 +292,68 @@ export class Simulator {
       }
     }
     this.persist();
+  }
+
+  /** Fecha a mercado (simulado) todas as posições abertas da carteira principal. */
+  closeAllAtMarket(reason = "fechamento manual a mercado"): { closed: { id: string; symbol: string; side: string; qty: number; entry: number; exit: number; pnl: number }[]; failed: string[]; totalPnl: number; equityAfter: number | null } {
+    const closed: { id: string; symbol: string; side: string; qty: number; entry: number; exit: number; pnl: number }[] = [];
+    const failed: string[] = [];
+    for (const trade of this.openTrades()) {
+      const mark = this.market.price(trade.symbol);
+      if (mark == null) {
+        failed.push(`${trade.symbol}: sem preço ao vivo`);
+        continue;
+      }
+      const result = closeAtMarket(toSim(trade), mark, trade.feePct, trade.slippagePct);
+      if (!result) continue;
+      this.cash += result.cashDelta;
+      copySim(trade, result.position);
+      trade.closedAt = Date.now();
+      this.recordOrder({
+        symbol: trade.symbol,
+        kind: "EXIT",
+        side: trade.side === "BUY" ? "SELL" : "BUY",
+        reason: "MANUAL",
+        price: result.event.price,
+        qty: result.event.qty,
+      });
+      if (trade.realizedPnl <= 0) {
+        this.lossStreak += 1;
+        this.sessionLossStreak += 1;
+      } else {
+        this.lossStreak = 0;
+        this.sessionLossStreak = 0;
+      }
+      this.lastExit.set(`${trade.symbol}|${trade.style}`, trade.closedAt);
+      this.db.updateTrade(trade);
+      this.activity("FILL", `${trade.symbol} fechada a mercado (simulado): ${reason}. P&L líquido da posição US$ ${trade.realizedPnl.toFixed(2)}.`, trade.symbol);
+      closed.push({ id: trade.id, symbol: trade.symbol, side: trade.side, qty: result.event.qty, entry: trade.entryFill, exit: result.event.price, pnl: trade.realizedPnl });
+    }
+    const equity = this.equity();
+    if (equity != null) this.applyLimits(equity);
+    this.persist();
+    return { closed, failed, totalPnl: closed.reduce((sum, item) => sum + item.pnl, 0), equityAfter: equity };
+  }
+
+  /** Perda adicional possível se todos os stops abertos forem atingidos a partir do preço atual. */
+  openRiskToStopUsd(): number {
+    return this.openTrades().reduce((sum, trade) => sum + riskToStopFromMark(toSim(trade), this.market.price(trade.symbol), trade.feePct), 0);
+  }
+
+  /** Na partida e a cada volta dos preços: com o dia perto do limite e posições abertas, fecha tudo a mercado. */
+  private runRecoveryGuard(): void {
+    const equity = this.equity();
+    if (!this.gate.observe(equity != null)) return;
+    if (equity == null || !this.openTrades().length) return;
+    const decision = startupGuard({
+      dailyLossUsd: usdLimit(this.db.getSettings(), "loss"),
+      dayPnl: equity - this.sessionStartEquity,
+      openRiskUsd: this.openRiskToStopUsd(),
+      openCount: this.openTrades().length,
+    });
+    if (!decision.close || !decision.reason) return;
+    this.activity("RISK", `${decision.reason}. Fechando tudo a mercado (simulado), sem esperar ordem.`, null);
+    this.closeAllAtMarket(decision.reason);
   }
 
   reset(): void {
@@ -440,7 +505,7 @@ function toSim(trade: TradeRow): SimPosition {
     fees: trade.fees,
     realizedPnl: trade.realizedPnl,
     status: trade.status,
-    closeReason: trade.closeReason === "SL" || trade.closeReason === "TP2" ? trade.closeReason : null,
+    closeReason: trade.closeReason === "SL" || trade.closeReason === "TP2" || trade.closeReason === "MANUAL" ? trade.closeReason : null,
   };
 }
 

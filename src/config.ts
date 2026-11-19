@@ -19,6 +19,10 @@ export interface AppConfig {
   accessTokenSha256: string | null;
   /** Padrão da pausa da cópia quando não há valor gravado no SQLite (COPY_PAUSED=true). */
   copyPausedDefault: boolean;
+  /** Padrão da pausa da carteira principal (AUTOTRADE_PAUSED=true) quando não há valor gravado. */
+  autoTradePausedDefault: boolean;
+  /** Traders suspensos por padrão (COPY_SUSPENDED_TRADERS=0x…,0x…) quando não há lista gravada. */
+  copySuspendedDefault: string[];
 }
 
 function num(value: string | undefined, fallback: number): number {
@@ -51,6 +55,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramChat: clean(env.TELEGRAM_CHAT_ID),
     accessToken: clean(env.DESK_ACCESS_TOKEN),
     accessTokenSha256: clean(env.DESK_ACCESS_TOKEN_SHA256),
+    autoTradePausedDefault: /^(1|true|yes|on|sim)$/i.test(env.AUTOTRADE_PAUSED?.trim() ?? ""),
+    copySuspendedDefault: (env.COPY_SUSPENDED_TRADERS ?? "").split(/[\s,;]+/).map((item) => item.trim().toLowerCase()).filter((item) => /^0x[a-f0-9]{40}$/.test(item)),
     copyPausedDefault: /^(1|true|yes|on|sim)$/i.test(env.COPY_PAUSED?.trim() ?? ""),
   };
 }

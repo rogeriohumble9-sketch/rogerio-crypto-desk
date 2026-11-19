@@ -54,6 +54,8 @@ export interface TradeRow {
 
 export class DeskDb {
   readonly db: DatabaseSync;
+  /** Valor de autoTrade quando não há valor gravado (AUTOTRADE_PAUSED=true muda para false). */
+  autoTradeDefault = true;
 
   constructor(filename: string) {
     if (filename !== ":memory:") {
@@ -192,6 +194,7 @@ export class DeskDb {
 
   getAutoTrade(): boolean {
     const raw = this.getRaw("autoTrade");
+    if (raw == null) return this.autoTradeDefault;
     return raw !== "off";
   }
 

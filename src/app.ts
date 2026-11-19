@@ -20,6 +20,7 @@ export interface RunningApp {
 export async function createApp(env: NodeJS.ProcessEnv = process.env): Promise<RunningApp> {
   const config = loadConfig(env);
   const db = new DeskDb(config.sqlitePath);
+  db.autoTradeDefault = !config.autoTradePausedDefault;
   db.migrate();
   db.prune(Date.now());
   const log = new Logger(db);

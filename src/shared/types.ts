@@ -257,6 +257,7 @@ export interface CopySettings {
 
 export interface CopyTraderView {
   address: string;
+  suspended: boolean;
   displayName: string | null;
   accountValue: number | null;
   dayPnl: number | null;
@@ -358,6 +359,7 @@ export interface CopyWatchView {
 
 export interface CopyView {
   settings: CopySettings;
+  suspendedTraders: string[];
   paused: boolean;
   pausedSource: "salvo" | "env";
   openRiskUsd: number | null;
@@ -390,7 +392,7 @@ export interface OrderView {
   symbol: string;
   kind: "ENTRY" | "EXIT";
   side: "BUY" | "SELL";
-  reason: "OPEN" | "TP1" | "TP2" | "SL";
+  reason: "OPEN" | "TP1" | "TP2" | "SL" | "MANUAL";
   price: number;
   qty: number;
   status: "filled";

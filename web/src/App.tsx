@@ -563,16 +563,30 @@ function CopyPanel({ state }: { state: DashboardState }) {
       <section className="copy-cards">
         {!copy.traders.length && <p className="sub">Nenhuma carteira seguida.</p>}
         {copy.traders.map((trader) => (
-          <article key={trader.address} className="clickable" onClick={() => setOpenAddress(trader.address)}>
+          <article key={trader.address} className={`clickable${trader.suspended ? " blocked" : ""}`} onClick={() => setOpenAddress(trader.address)}>
             <div className="who">
               <span className="avatar">{(trader.displayName ?? trader.address).slice(2, 3).toUpperCase()}</span>
               <div>
                 <strong>{trader.displayName ?? "carteira"}</strong>
                 <small className="addr">{shortAddr(trader.address)}</small>
+                {trader.suspended && <small className="suspended"><b>SUSPENSO</b> até revisão do Risk Manager · sem novas entradas</small>}
               </div>
             </div>
             <p className={`mono ${signClass(trader.copiedPnl)}`}>{trader.copiedPnl == null ? "DADOS INDISPONÍVEIS" : usd(trader.copiedPnl)}</p>
             <small>P&L copiado · vol. fonte {trader.feedStale || trader.dayVolume == null ? "DADOS INDISPONÍVEIS" : compactUsd(trader.dayVolume)}</small>
+            <button
+              title="Suspende só as entradas novas deste trader. A pausa geral não o reativa."
+              onClick={(event) => {
+                event.stopPropagation();
+                void fetch("/api/copy/suspend", {
+                  method: "PUT",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ address: trader.address, suspended: !trader.suspended }),
+                });
+              }}
+            >
+              {trader.suspended ? "Reativar" : "Suspender"}
+            </button>
             <button
               onClick={(event) => {
                 event.stopPropagation();
