@@ -9,7 +9,14 @@ import type { CopyDesk } from "./services/copyDesk.js";
 import type { Simulator } from "./services/simulator.js";
 import { buildBook, buildHealth, buildKlines, buildState, isInterval, type StateSources } from "./state.js";
 import type { DeskLayout, Report } from "./shared/types.js";
-import { accessCookie, hasAccessCookie, queryTokenMatches, requestIsHttps } from "./access.js";
+import {
+  accessCookieFromHash,
+  digestHex,
+  hasAccessCookieHash,
+  normalizeHash,
+  queryTokenMatchesHash,
+  requestIsHttps,
+} from "./access.js";
 import type { DeskDb } from "./db.js";
 
 export interface HttpApp {
@@ -40,6 +47,7 @@ export async function listenHttp(opts: {
   publicDir: string;
   onAutoTrade: (enabled: boolean) => void;
   accessToken: string | null;
+  accessTokenSha256?: string | null;
 }): Promise<HttpApp> {
   const clients = new Set<http.ServerResponse>();
   const server = http.createServer(async (req, res) => {
@@ -88,17 +96,19 @@ export async function listenHttp(opts: {
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : opts.port;
 
+  const gateHash: string | null =
+    normalizeHash(opts.accessTokenSha256) ?? (opts.accessToken ? digestHex(opts.accessToken) : null);
+
   function allow(req: http.IncomingMessage, res: http.ServerResponse, url: URL): boolean {
-    const token = opts.accessToken;
-    if (!token) return true;
-    if (hasAccessCookie(req.headers.cookie, token)) return true;
+    if (!gateHash) return true;
+    if (hasAccessCookieHash(req.headers.cookie, gateHash)) return true;
     const provided = url.searchParams.get("token");
-    if (queryTokenMatches(provided, token)) {
+    if (queryTokenMatchesHash(provided, gateHash)) {
       url.searchParams.delete("token");
       const location = `${url.pathname}${url.search}`;
       res.writeHead(302, {
         Location: location,
-        "Set-Cookie": accessCookie(token, requestIsHttps(req)),
+        "Set-Cookie": accessCookieFromHash(gateHash, requestIsHttps(req)),
         "Cache-Control": "no-store",
       });
       res.end();
@@ -108,7 +118,7 @@ export async function listenHttp(opts: {
       json(res, 401, { error: "acesso negado" });
     } else {
       res.writeHead(401, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end("<!doctype html><meta charset=\"utf-8\"><title>Mesa</title><p>Acesso negado. Abra o endereço uma vez com ?token= e o valor de DESK_ACCESS_TOKEN.</p>");
+      res.end("<!doctype html><meta charset=\"utf-8\"><title>Mesa</title><p>Acesso negado. Abra o endereço uma vez com ?token= e a senha de acesso.</p>");
     }
     return false;
   }

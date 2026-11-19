@@ -45,9 +45,29 @@ export function requestIsHttps(req: IncomingMessage): boolean {
   return first?.split(",")[0]?.trim() === "https";
 }
 
+export function normalizeHash(value: string | null | undefined): string | null {
+  const v = value?.trim().toLowerCase();
+  return v && /^[0-9a-f]{64}$/.test(v) ? v : null;
+}
+
+export function hasAccessCookieHash(header: string | undefined, hash: string): boolean {
+  const value = cookieValue(header, ACCESS_COOKIE);
+  if (!value) return false;
+  return safeEqual(value, hash);
+}
+
+export function queryTokenMatchesHash(token: string | null, hash: string): boolean {
+  if (!token) return false;
+  return safeEqual(digestHex(token), hash);
+}
+
 export function accessCookie(token: string, secure: boolean): string {
+  return accessCookieFromHash(digestHex(token), secure);
+}
+
+export function accessCookieFromHash(hash: string, secure: boolean): string {
   const parts = [
-    `${ACCESS_COOKIE}=${digestHex(token)}`,
+    `${ACCESS_COOKIE}=${hash}`,
     "HttpOnly",
     "Path=/",
     "SameSite=Lax",

@@ -16,6 +16,7 @@ export interface AppConfig {
   telegramToken: string | null;
   telegramChat: string | null;
   accessToken: string | null;
+  accessTokenSha256: string | null;
 }
 
 function num(value: string | undefined, fallback: number): number {
@@ -47,5 +48,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramToken: clean(env.TELEGRAM_BOT_TOKEN),
     telegramChat: clean(env.TELEGRAM_CHAT_ID),
     accessToken: clean(env.DESK_ACCESS_TOKEN),
+    accessTokenSha256: clean(env.DESK_ACCESS_TOKEN_SHA256),
   };
 }

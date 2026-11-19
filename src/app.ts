@@ -88,6 +88,7 @@ export async function createApp(env: NodeJS.ProcessEnv = process.env): Promise<R
     copy,
     publicDir: path.resolve("dist/public"),
     accessToken: config.accessToken,
+    accessTokenSha256: config.accessTokenSha256,
     onAutoTrade: (enabled) => {
       activity("EXEC", enabled ? "Simulação automática ligada." : "Simulação automática pausada. Nenhuma entrada nova.", null);
       if (!enabled) return;
